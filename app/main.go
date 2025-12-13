@@ -74,7 +74,7 @@ func readContentObject(hash string) (string, error) {
 	if len(parts) != 1 {
        return "", fmt.Errorf("invalid object")
 	}
-	return parts[0], nil
+	return parts[1], nil
 }
 
 func readObject(hash string) bytes.Buffer {
