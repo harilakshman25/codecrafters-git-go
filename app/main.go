@@ -71,7 +71,7 @@ func readContentObject(hash string) (string, error) {
 
 	buf := readObject(hash)
 	parts := strings.SplitN(buf.String(), "\x00", 2)
-	if len(parts) != 1 {
+	if len(parts) != 2 {
        return "", fmt.Errorf("invalid object")
 	}
 	return parts[1], nil
