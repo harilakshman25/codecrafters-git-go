@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"compress/zlib"
 	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path"
+	"sort"
 )
 
 func main() {
@@ -29,6 +31,8 @@ func main() {
 		err = handleHashObject(os.Args[2:])
 	case "ls-tree":
 		err = handleLsTree(os.Args[2:])
+	case "write-tree":
+		err = handleWriteTree()
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
 		os.Exit(1)
@@ -115,6 +119,20 @@ func handleLsTree(args []string) error {
 	return nil
 }
 
+func handleWriteTree() error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+    sha, err := writeTree(cwd)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(sha)
+	return nil
+}
+
 func readBlob(sha string) ([]byte, error) {
 	fullContent, err := decompressObject(sha)
 	if err != nil {
@@ -173,6 +191,60 @@ func readTree(sha string) ([]string, error) {
 	}
 
 	return names, nil
+}
+
+func writeTree(dir string) (string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
+
+	var treeEntries []byte
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == ".git" {
+			continue 
+		}
+
+		fullPath := path.Join(dir, name)
+		var mode string
+		var shaHex string
+
+		if entry.IsDir() {
+			mode = "40000"
+			shaHex, err = writeTree(fullPath)
+		} else {
+			mode = "100644"
+			content, err := os.ReadFile(fullPath)
+			if err != nil {
+				return "", err
+			}
+			shaHex, err = writeBlob(content)
+		}
+
+		if err != nil {
+			return "", err
+		}
+
+		shaBinary, err := hex.DecodeString(shaHex)
+		if err != nil {
+			return "", err
+		}
+
+		entryLine := []byte(fmt.Sprintf("%s %s\x00", mode, name))
+		entryLine = append(entryLine, shaBinary...)
+		treeEntries = append(treeEntries, entryLine...)
+	}
+
+	header := []byte(fmt.Sprintf("tree %d\x00", len(treeEntries)))
+	fullContent := append(header, treeEntries...)
+	sha := fmt.Sprintf("%x", sha1.Sum(fullContent))
+	err = compressAndWriteObject(sha, fullContent)
+	return sha, err
 }
 
 func decompressObject(sha string) ([]byte, error) {
