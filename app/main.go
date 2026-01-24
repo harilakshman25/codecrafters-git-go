@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"sort"
+	"time"
 )
 
 func main() {
@@ -33,6 +34,8 @@ func main() {
 		err = handleLsTree(os.Args[2:])
 	case "write-tree":
 		err = handleWriteTree()
+	case "commit-tree":
+		err = handleCommitTree(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
 		os.Exit(1)
@@ -129,6 +132,18 @@ func handleWriteTree() error {
 		return err
 	}
 
+	fmt.Println(sha)
+	return nil
+}
+
+func handleCommitTree(args []string) error {
+    if len(args) < 5 || args[1] != "-p" || args[3] != "-m" {
+		return errors.New("usage: mygit commit-tree <tree-sha> -p <commit_sha> -m <msg>")
+	}
+    sha, err := commitTree(args[0], args[2], args[4])
+	if err != nil {
+		return err
+	}
 	fmt.Println(sha)
 	return nil
 }
@@ -244,6 +259,19 @@ func writeTree(dir string) (string, error) {
 	fullContent := append(header, treeEntries...)
 	sha := fmt.Sprintf("%x", sha1.Sum(fullContent))
 	err = compressAndWriteObject(sha, fullContent)
+	return sha, err
+}
+
+func commitTree(tree_sha string, commit_sha string, commit_msg string) (string, error) {
+	data := []byte(fmt.Sprintf("parent %s\n", commit_sha))
+	_, offset := time.Now().Zone()
+    data = fmt.Appendf(data, "author Hari <harilakshman24@gmail.com> %d +%d\n", time.Now().Unix(), offset)
+	data = fmt.Appendf(data, "committer Lakshman <harilakshman509716@kgpian.iitkgp.ac.in> %d +%d\n\n", time.Now().Unix(), offset)
+	data = append(data, []byte(commit_msg)...)
+	header := []byte(fmt.Sprintf("commit %d\x00tree %s\n", len(data), tree_sha))
+    content := append(header, data...)
+	sha := fmt.Sprintf("%x", sha1.Sum(content))
+	err := compressAndWriteObject(sha, content)
 	return sha, err
 }
 
