@@ -267,7 +267,7 @@ func commitTree(tree_sha string, commit_sha string, commit_msg string) (string, 
 	_, offset := time.Now().Zone()
     data = fmt.Appendf(data, "author Hari <harilakshman24@gmail.com> %d +%d\n", time.Now().Unix(), offset)
 	data = fmt.Appendf(data, "committer Lakshman <harilakshman509716@kgpian.iitkgp.ac.in> %d +%d\n\n", time.Now().Unix(), offset)
-	data = append(data, []byte(commit_msg)...)
+	data = fmt.Appendf(data, "%s\n", commit_msg)
 	header := []byte(fmt.Sprintf("commit %d\x00tree %s\n", len(data), tree_sha))
     content := append(header, data...)
 	sha := fmt.Sprintf("%x", sha1.Sum(content))
