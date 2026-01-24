@@ -3,155 +3,215 @@ package main
 import (
 	"bytes"
 	"compress/zlib"
+	"crypto/sha1"
 	"errors"
 	"fmt"
-	"os"
-	"strings"
-	"path"
 	"io"
-	"crypto/sha1"
+	"os"
+	"path"
 )
 
-// Usage: your_program.sh <command> <arg1> <arg2> ...
 func main() {
-	// You can use print statements as follows for debugging, they'll be visible when running tests.
-	fmt.Fprintf(os.Stderr, "Logs from your program will appear here!\n")
-
 	if len(os.Args) < 2 {
 		fmt.Fprintf(os.Stderr, "usage: mygit <command> [<args>...]\n")
 		os.Exit(1)
 	}
 
-	switch command := os.Args[1]; command {
+	command := os.Args[1]
+	var err error
+
+	switch command {
 	case "init":
-		initRepo("")
-		fmt.Println("Initialized git directory")
+		err = handleInit()
 	case "cat-file":
-		if len(os.Args) < 4 {
-			handleError(errors.New("usage: mygit cat-file -p [<args>...]"))
-			os.Exit(1)
-		}
-
-		if os.Args[2] != "-p" {
-           handleError(errors.New("usage: mygit cat-file -p [<args>...]"))
-		   os.Exit(1)
-		}
-
-		content, err := readContentObject(os.Args[3])
-		if err != nil {
-			handleError(err)
-			return
-		}
-
-		fmt.Print(content)
+		err = handleCatFile(os.Args[2:])
 	case "hash-object":
-		if len(os.Args) < 4 {
-			handleError(errors.New("usage: mygit hash-object -w [<args>...]"))
-			os.Exit(1)
-		}
-
-		if os.Args[2] != "-w" {
-		   handleError(errors.New("usage: mygit hash-object -w [<args>...]"))
-		   os.Exit(1)
-		}
-		data, err := os.ReadFile(os.Args[3])
-		if err != nil {
-			handleError(err)
-			return
-		}
-
-		hash := writeObject(data)
-		fmt.Println(hash)
+		err = handleHashObject(os.Args[2:])
+	case "ls-tree":
+		err = handleLsTree(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
 		os.Exit(1)
 	}
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 }
 
-func initRepo(repoPath string) {
-	for _, dir := range []string{".git", ".git/objects", ".git/refs", ".git/refs/heads"} {
-		dirPath := path.Join(repoPath, dir)
-		if err := os.MkdirAll(dirPath, 0755); err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating directory: %s\n", err)
+func handleInit() error {
+	dirs := []string{
+		".git",
+		".git/objects",
+		".git/refs",
+		".git/refs/heads",
+	}
+
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
 		}
 	}
 
-	headFileContents := []byte("ref: refs/heads/master\n")
-	if err := os.WriteFile(".git/HEAD", headFileContents, 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "Error writing file: %s\n", err)
+	headContent := []byte("ref: refs/heads/master\n")
+	if err := os.WriteFile(".git/HEAD", headContent, 0644); err != nil {
+		return err
 	}
+
+	fmt.Println("Initialized git directory")
+	return nil
 }
 
-func readContentObject(hash string) (string, error) {
-	if len(hash) != 40 {
-		return "", fmt.Errorf("invalid len of the hash")
+func handleCatFile(args []string) error {
+	if len(args) < 2 || args[0] != "-p" {
+		return errors.New("usage: mygit cat-file -p <blob_sha>")
 	}
 
-	buf := readObject(hash)
-	parts := strings.SplitN(buf.String(), "\x00", 2)
-	if len(parts) != 2 {
-       return "", fmt.Errorf("invalid object")
+	sha := args[1]
+	data, err := readBlob(sha)
+	if err != nil {
+		return err
 	}
+
+	fmt.Print(string(data))
+	return nil
+}
+
+func handleHashObject(args []string) error {
+	if len(args) < 2 || args[0] != "-w" {
+		return errors.New("usage: mygit hash-object -w <file>")
+	}
+
+	filePath := args[1]
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+
+	sha, err := writeBlob(content)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(sha)
+	return nil
+}
+
+func handleLsTree(args []string) error {
+	if len(args) < 2 || args[0] != "--name-only" {
+		return errors.New("usage: mygit ls-tree --name-only <tree_sha>")
+	}
+
+	sha := args[1]
+	entries, err := readTree(sha)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		fmt.Println(entry)
+	}
+	return nil
+}
+
+func readBlob(sha string) ([]byte, error) {
+	fullContent, err := decompressObject(sha)
+	if err != nil {
+		return nil, err
+	}
+
+	parts := bytes.SplitN(fullContent, []byte{0}, 2)
+	if len(parts) < 2 {
+		return nil, errors.New("invalid object format")
+	}
+
 	return parts[1], nil
 }
 
-func readObject(hash string) bytes.Buffer {
-    dir := fmt.Sprintf(".git/objects/%s", hash[:2])
-	fileName := fmt.Sprintf("%s/%s", dir, hash[2:])
+func writeBlob(content []byte) (string, error) {
+	header := []byte(fmt.Sprintf("blob %d\x00", len(content)))
+	fullData := append(header, content...)
 
-	fileContent, err := os.ReadFile(fileName) 
+	sha := fmt.Sprintf("%x", sha1.Sum(fullData))
+	
+	err := compressAndWriteObject(sha, fullData)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "read file got err=%v", err)
-		os.Exit(1)
+		return "", err
 	}
 
-    rcloser, err := zlib.NewReader(bytes.NewReader(fileContent))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "zlib new reader got err=%v", err)
-		os.Exit(1)
-	}
-
-	defer rcloser.Close()
-
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, rcloser); err != nil {
-		fmt.Fprintf(os.Stderr, "read file to buffer got err=%v\n", err)
-		os.Exit(1)
-	}
-
-	return buf
-
+	return sha, nil
 }
 
-func writeObject(data []byte) string {
-	header := fmt.Sprintf("blob %d\x00", len(data))
-	storeData := append([]byte(header), data...)
-
-	var buf bytes.Buffer
-	zwriter := zlib.NewWriter(&buf)
-	if _, err := zwriter.Write(storeData); err != nil {
-		fmt.Fprintf(os.Stderr, "zlib write got err=%v\n", err)
-		os.Exit(1)
-	}
-	zwriter.Close()
-
-	hash := fmt.Sprintf("%x", sha1.Sum(storeData))
-
-	dir := fmt.Sprintf(".git/objects/%s", hash[:2])
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "mkdir got err=%v\n", err)
-		os.Exit(1)
+func readTree(sha string) ([]string, error) {
+	fullContent, err := decompressObject(sha)
+	if err != nil {
+		return nil, err
 	}
 
-	fileName := fmt.Sprintf("%s/%s", dir, hash[2:])
-	if err := os.WriteFile(fileName, buf.Bytes(), 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "write file got err=%v\n", err)
-		os.Exit(1)
+	nullIndex := bytes.IndexByte(fullContent, 0)
+	if nullIndex == -1 {
+		return nil, errors.New("invalid tree object header")
 	}
 
-	return hash
+	data := fullContent[nullIndex+1:]
+	var names []string
+
+	for len(data) > 0 {
+		nullIdx := bytes.IndexByte(data, 0)
+		if nullIdx == -1 {
+			break
+		}
+
+		modeAndName := data[:nullIdx]
+		parts := bytes.SplitN(modeAndName, []byte{' '}, 2)
+		if len(parts) == 2 {
+			names = append(names, string(parts[1]))
+		}
+
+		data = data[nullIdx+1+20:]
+	}
+
+	return names, nil
 }
 
-func handleError(err error) {
-	fmt.Fprint(os.Stderr, err.Error()+"\n")
+func decompressObject(sha string) ([]byte, error) {
+	if len(sha) != 40 {
+		return nil, errors.New("invalid hash length")
+	}
+
+	objectPath := path.Join(".git", "objects", sha[:2], sha[2:])
+	file, err := os.Open(objectPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	zlibReader, err := zlib.NewReader(file)
+	if err != nil {
+		return nil, err
+	}
+	defer zlibReader.Close()
+
+	return io.ReadAll(zlibReader)
+}
+
+func compressAndWriteObject(sha string, data []byte) error {
+	objectDir := path.Join(".git", "objects", sha[:2])
+	if err := os.MkdirAll(objectDir, 0755); err != nil {
+		return err
+	}
+
+	objectPath := path.Join(objectDir, sha[2:])
+	file, err := os.Create(objectPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	zlibWriter := zlib.NewWriter(file)
+	if _, err := zlibWriter.Write(data); err != nil {
+		return err
+	}
+	return zlibWriter.Close()
 }
