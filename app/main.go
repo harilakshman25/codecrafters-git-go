@@ -579,7 +579,7 @@ func readDeltaSize(r *bytes.Buffer) (uint64, error) {
 	return size, nil
 }
 
-// Create a struct to hold deltas that are waiting for their base objects
+// struct to hold deltas that are waiting for their base objects
 type pendingDelta struct {
 	baseShaHex string
 	deltaData  []byte
@@ -773,8 +773,7 @@ func checkout_tree(treeShaHex string, basePath string) error {
 
 	// Parse the tree entries
 	// Tree entry format: "<mode> <name>\x00<20-byte-sha>"
-	
-	// Wrap the bytes.Reader in a bufio.Reader to get access to ReadBytes
+
 	reader := bufio.NewReader(bytes.NewReader(content))
 	
 	for {
