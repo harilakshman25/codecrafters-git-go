@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"path/filepath"
 )
 
 func main() {
@@ -354,7 +355,7 @@ func handleClone(args []string) error {
 	capabilities = strings.TrimSuffix(capabilities, "\n")
 
 	// 3. Fetch packfile
-	packData, err := fetchPackfile(url, wantedSHA, capabilities)
+	packData, err := fetchPackfile(url, wantedSHA)
 	if err != nil {
 		return err
 	}
@@ -368,6 +369,14 @@ func handleClone(args []string) error {
 	// 5. Checkout: we need to read the commit tree and write files.
 	// For now, we can just print success.
 	fmt.Println("Clone completed (objects downloaded).")
+
+	fmt.Println("Checking out files...")
+    if err := checkout(wantedSHA, targetDir); err != nil {
+		fmt.Printf("Error during checkout: %v\n", err)
+		return err
+    }
+    fmt.Println("Checkout complete!")
+	
 	return nil
 }
 
@@ -396,15 +405,16 @@ func readPktLine(r io.Reader) ([]byte, error) {
 	return data, nil
 }
 
-func fetchPackfile(repoURL, wantedSHA, capabilities string) ([]byte, error) {
+func fetchPackfile(repoURL, wantedSHA string) ([]byte, error) {
+	capabilities := "side-band-64k"
 	wantLine := fmt.Sprintf("want %s %s\n", wantedSHA, capabilities)
-	doneLine := "done\n"
-	wantPkt := fmt.Sprintf("%04x%s", len(wantLine)+4, wantLine)
-	donePkt := fmt.Sprintf("%04x%s", len(doneLine)+4, doneLine)
-	body := wantPkt + "0000" + donePkt
-
-	fmt.Printf("Request body (hex):\n%x\n", body)
-	fmt.Printf("Request body (string):\n%q\n", body)
+    doneLine := "done\n"
+    wantPkt := fmt.Sprintf("%04x%s", len(wantLine)+4, wantLine)
+    donePkt := fmt.Sprintf("%04x%s", len(doneLine)+4, doneLine)
+    body := wantPkt + "0000" + donePkt
+	
+	// fmt.Printf("Request body (hex):\n%x\n", body)
+	// fmt.Printf("Request body (string):\n%q\n", body)
 
 	req, err := http.NewRequest("POST", repoURL+"/git-upload-pack", strings.NewReader(body))
 	if err != nil {
@@ -419,8 +429,8 @@ func fetchPackfile(repoURL, wantedSHA, capabilities string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
-	fmt.Printf("Response status: %s\n", resp.Status)
-	fmt.Printf("Content-Type: %s\n", resp.Header.Get("Content-Type"))
+	// fmt.Printf("Response status: %s\n", resp.Status)
+	// fmt.Printf("Content-Type: %s\n", resp.Header.Get("Content-Type"))
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -456,7 +466,7 @@ func fetchPackfile(repoURL, wantedSHA, capabilities string) ([]byte, error) {
 			case 1:
 				payload = payload[1:]
 			case 2:
-				fmt.Fprintf(os.Stderr, "remote: %s\n", string(payload[1:]))
+				fmt.Printf("remote: %s\n", string(payload[1:]))
 				continue
 			case 3:
 				return nil, fmt.Errorf("remote error: %s", string(payload[1:]))
@@ -467,98 +477,370 @@ func fetchPackfile(repoURL, wantedSHA, capabilities string) ([]byte, error) {
 	return packData, nil
 }
 
-func readOffset(r io.Reader) (uint64, error) {
-	var offset uint64
-	var b [1]byte
+// func readOffset(r io.Reader) (uint64, error) {
+//     var offset uint64
+//     var b [1]byte
+//     for {
+//         if _, err := r.Read(b[:]); err != nil {
+//             return 0, err
+//         }
+
+//         offset = (offset + 1) << 7
+//         offset |= uint64(b[0] & 0x7f)
+
+//         if b[0]&0x80 == 0 {
+//             break
+//         }
+//     }
+//     return offset, nil
+// }
+
+func applyDelta(referenceHashHex string, deltaData []byte) ([]byte, error) {
+	// 1. Fetch the base object that this delta modifies
+	baseFullContent, err := decompressObject(referenceHashHex)
+	if err != nil {
+		return nil, fmt.Errorf("could not read base object %s for delta: %v", referenceHashHex, err)
+	}
+
+	//decompressObject returns the git header too
+	// must separate the header from the actual base data
+	parts := bytes.SplitN(baseFullContent, []byte{0}, 2)
+	if len(parts) < 2 {
+		return nil, errors.New("invalid base object format")
+	}
+	baseHeader := parts[0]
+	baseData := parts[1]
+	deltaBuffer := bytes.NewBuffer(deltaData)
+	
+	// Read Source and target lengths (var-len int)
+	_, err = readDeltaSize(deltaBuffer) // Source length
+	if err != nil { return nil, err}
+
+	targetLength, err := readDeltaSize(deltaBuffer)
+	if err != nil { return nil, err}
+
+	var targetData []byte
+
+	//Process the Insert/Copy commands
+	for deltaBuffer.Len() > 0 {
+		command, _ := deltaBuffer.ReadByte()
+		
+		if command&0x80 == 0 {
+			//INSERT command
+			insertLen := int(command & 0x7f)
+			insertData := make([]byte, insertLen)
+			deltaBuffer.Read(insertData)
+			targetData = append(targetData, insertData...)
+		} else {
+			//COPY command
+			offset := uint32(0)
+			for i := 0; i < 4; i++ {
+				if command&(1<<i) != 0 {
+					b, _ := deltaBuffer.ReadByte()
+					offset |= uint32(b) << (8*i)
+				}
+			}
+			size := uint32(0)
+			for i := 0; i < 3; i++ {
+				if command&(0b10000<<i) != 0 {
+					b, _ := deltaBuffer.ReadByte()
+					size |= uint32(b) << (8*i)
+				}
+			}
+			if size == 0 {
+				size = 0x10000
+			}
+			targetData = append(targetData, baseData[offset:offset+size]...)
+		}
+	}
+	if len(targetData) != int(targetLength) {
+		return nil, fmt.Errorf("target data length mismatch")
+	}
+	// Reattach the header
+	objTypeStr := strings.Split(string(baseHeader), " ")[0]
+	finalHeader := fmt.Appendf(nil, "%s %d\x00", objTypeStr, len(targetData))
+	return append(finalHeader, targetData...), nil
+}
+
+func readDeltaSize(r *bytes.Buffer) (uint64, error) {
+	var size uint64
+	var shift uint 
 	for {
-		if _, err := r.Read(b[:]); err != nil {
+		b, err := r.ReadByte()
+		if err != nil {
 			return 0, err
 		}
-		offset = (offset << 7) | uint64(b[0]&0x7f)
-		if b[0]&0x80 == 0 {
+		size |= uint64(b&0x7f) << shift
+		shift += 7
+        if b&0x80 == 0 {
 			break
 		}
-		offset++
 	}
-	return offset, nil
+	return size, nil
+}
+
+// Create a struct to hold deltas that are waiting for their base objects
+type pendingDelta struct {
+	baseShaHex string
+	deltaData  []byte
 }
 
 func parseAndWritePackfile(packData []byte) error {
-    r := bytes.NewReader(packData)
+	r := bytes.NewReader(packData)
 
-    var magic [4]byte
-    if _, err := r.Read(magic[:]); err != nil || string(magic[:]) != "PACK" {
-        return errors.New("invalid packfile magic")
-    }
+	var magic [4]byte
+	if _, err := r.Read(magic[:]); err != nil || string(magic[:]) != "PACK" {
+		return errors.New("invalid packfile magic")
+	}
 
-    var version [4]byte
-    if _, err := r.Read(version[:]); err != nil {
-        return err
-    }
+	var version [4]byte
+	if _, err := r.Read(version[:]); err != nil {
+		return err
+	}
 
-    var numObj [4]byte
-    if _, err := r.Read(numObj[:]); err != nil {
-        return err
-    }
-    objCount := binary.BigEndian.Uint32(numObj[:])
-    fmt.Printf("Packfile contains %d objects\n", objCount)
+	var numObj [4]byte
+	if _, err := r.Read(numObj[:]); err != nil {
+		return err
+	}
+	objCount := binary.BigEndian.Uint32(numObj[:])
+	fmt.Printf("Packfile contains %d objects\n", objCount)
 
-    for i := 0; i < int(objCount); i++ {
-        // Read object header: type and size
-        firstByte, err := r.ReadByte()
-        if err != nil {
-            return err
-        }
-        objType := (firstByte >> 4) & 0x07
-        size := uint64(firstByte & 0x0f)
-        shift := 4
-        for firstByte&0x80 != 0 {
-            b, err := r.ReadByte()
-            if err != nil {
-                return err
-            }
-            size |= uint64(b&0x7f) << shift
-            shift += 7
-            firstByte = b
-        }
+	// Slice to queue deltas we can't process yet
+	var delayedDeltas []pendingDelta
 
-       // --- Handle delta base info before zlib ---
-        if objType == 7 { // REF_DELTA (Type 7): 20-byte base SHA
-            baseSha := make([]byte, 20)
-            if _, err := r.Read(baseSha); err != nil {
-                return err
-            }
-        } else if objType == 6 { // OFS_DELTA (Type 6): variable-length offset
-            if _, err := readOffset(r); err != nil {
-                return err
-            }
-        }
+	// --- PASS 1: Extract base objects and queue deltas ---
+	for i := 0; i < int(objCount); i++ {
+		firstByte, err := r.ReadByte()
+		if err != nil {
+			return err
+		}
+		objType := (firstByte >> 4) & 0x07
+		size := uint64(firstByte & 0x0f)
+		shift := 4
+		for firstByte&0x80 != 0 {
+			b, err := r.ReadByte()
+			if err != nil {
+				return err
+			}
+			size |= uint64(b&0x7f) << shift
+			shift += 7
+			firstByte = b
+		}
 
-        // Now read the compressed object data
-        zlibReader, err := zlib.NewReader(r)
-        if err != nil {
-            return err
-        }
-        objData, err := io.ReadAll(zlibReader)
-        zlibReader.Close()
-        if err != nil {
-            return err
-        }
+		if objType == 6 { 
+			return errors.New("OFS_DELTA not supported in this implementation")
+		}
 
-        // Only write full objects (commit, tree, blob, tag)
-        // Delta objects (type 6,7) are skipped for now.
-        if objType >= 1 && objType <= 4 {
-            sha := fmt.Sprintf("%x", sha1.Sum(objData))
-            if err := compressAndWriteObject(sha, objData); err != nil {
-                return err
-            }
-        } else {
-            // Delta or other types – ignore (or store for later resolution)
-            // If you want to handle deltas fully, you'd need to resolve them.
-            // fmt.Fprintf(os.Stderr, "Skipping object type %d\n", objType)
-        }
-    }
-    return nil
+		var baseShaHex string
+		if objType == 7 { // REF_DELTA
+			baseSha := make([]byte, 20)
+			if _, err := r.Read(baseSha); err != nil {
+				return err
+			}
+			baseShaHex = fmt.Sprintf("%x", baseSha)
+		}
+
+		zlibReader, err := zlib.NewReader(r)
+		if err != nil {
+			return err
+		}
+		objData, err := io.ReadAll(zlibReader)
+		zlibReader.Close()
+		if err != nil {
+			return err
+		}
+
+		if objType >= 1 && objType <= 4 {
+			// Map the integer type to the Git string type
+			var typeStr string
+			switch objType {
+			case 1:
+				typeStr = "commit"
+			case 2:
+				typeStr = "tree"
+			case 3:
+				typeStr = "blob"
+			case 4:
+				typeStr = "tag"
+			}
+
+			// Construct the Git object header: "<type> <length>\x00"
+			header := fmt.Sprintf("%s %d\x00", typeStr, len(objData))
+			
+			// Combine the header and the raw data
+			fullContent := append([]byte(header), objData...)
+
+			// Hash the FULL content (header + data) to get the correct Git SHA
+			sha := fmt.Sprintf("%x", sha1.Sum(fullContent))
+			
+			// Write the full content (which includes the header) to disk
+			if err := compressAndWriteObject(sha, fullContent); err != nil {
+				return err
+			}
+		} else if objType == 7 {
+			// It's a delta. Queue it up for Pass 2.
+			delayedDeltas = append(delayedDeltas, pendingDelta{
+				baseShaHex: baseShaHex,
+				deltaData:  objData,
+			})
+		}
+	}
+
+	// --- PASS 2: Resolve deltas (Multi-pass for delta chains) ---
+	unresolvedCount := len(delayedDeltas)
+	for unresolvedCount > 0 {
+		resolvedInThisPass := 0
+		var nextPassDeltas []pendingDelta
+
+		for _, pDelta := range delayedDeltas {
+			// Check if the base object is on disk yet
+			// decompressObject will throw an error if the file is missing
+			_, err := decompressObject(pDelta.baseShaHex)
+			
+			if err != nil {
+				// Base doesn't exist yet, push it to the next pass
+				nextPassDeltas = append(nextPassDeltas, pDelta)
+				continue
+			}
+
+			// The base exists! We can safely apply the delta.
+			targetData, err := applyDelta(pDelta.baseShaHex, pDelta.deltaData)
+			if err != nil {
+				return fmt.Errorf("failed applying delta to %s: %v", pDelta.baseShaHex, err)
+			}
+
+			sha := fmt.Sprintf("%x", sha1.Sum(targetData))
+			if err := compressAndWriteObject(sha, targetData); err != nil {
+				return err
+			}
+			resolvedInThisPass++
+		}
+
+		// If we loop through all pending deltas and resolve 0 of them, 
+		// we are stuck in an infinite loop due to a missing base object.
+		if resolvedInThisPass == 0 && len(nextPassDeltas) > 0 {
+			return errors.New("delta resolution stalled: missing base objects")
+		}
+
+		// Set up the slice for the next while-loop iteration
+		delayedDeltas = nextPassDeltas
+		unresolvedCount = len(delayedDeltas)
+	}
+
+	return nil
+}
+
+func checkout(commitSha string, targetDir string) error {
+	//1. Get the commit object
+	commitData, err := decompressObject(commitSha)
+	if err != nil {
+		return fmt.Errorf("failed to read commit object: %v", err)
+	}
+
+	//2. Parse the commit to find the root tree
+	parts := bytes.SplitN(commitData, []byte{0}, 2)
+	if len(parts) < 2 {
+		return errors.New("invalid commit object format")
+	}
+	body := string(parts[1])
+
+	var treeSha string
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "tree ") {
+			treeSha = strings.TrimPrefix(line, "tree ")
+			break
+		}
+	}
+	if treeSha == "" {
+		return errors.New("could not find tree in commit")
+	}
+	// 3. Kick off the recursive tree writing
+	return checkout_tree(treeSha, targetDir)
+}
+
+func checkout_tree(treeShaHex string, basePath string) error {
+	treeData, err := decompressObject(treeShaHex)
+	if err != nil {
+		return fmt.Errorf("failed to read tree object %s: %v", treeShaHex, err)
+	}
+
+	// Strip the "tree <size>\x00" header
+	parts := bytes.SplitN(treeData, []byte{0}, 2)
+	if len(parts) < 2 {
+		return errors.New("invalid tree object format")
+	}
+	content := parts[1]
+
+	// Parse the tree entries
+	// Tree entry format: "<mode> <name>\x00<20-byte-sha>"
+	
+	// Wrap the bytes.Reader in a bufio.Reader to get access to ReadBytes
+	reader := bufio.NewReader(bytes.NewReader(content))
+	
+	for {
+		// Read the mode (permissions) up to the space character
+		modeBytes, err := reader.ReadBytes(' ')
+		if err == io.EOF {
+			break // We've reached the end of the tree content, break the loop!
+		}
+		if err != nil {
+			return err
+		}
+		modeStr := strings.TrimSpace(string(modeBytes))
+
+		// Read the file/folder name up to the null byte
+		nameBytes, err := reader.ReadBytes(0)
+		if err != nil {
+			return err
+		}
+		nameStr := strings.TrimRight(string(nameBytes), "\x00")
+
+		// Read the 20-byte binary SHA
+		shaBytes := make([]byte, 20)
+		// Use io.ReadFull to ensure we grab exactly 20 bytes for the SHA
+		if _, err := io.ReadFull(reader, shaBytes); err != nil {
+			return err
+		}
+		entryShaHex := fmt.Sprintf("%x", shaBytes)
+
+		// Determine the full path to write to
+		entryPath := filepath.Join(basePath, nameStr)
+
+		if modeStr == "40000" { 
+			// It's a directory (Tree)
+			if err := os.MkdirAll(entryPath, 0755); err != nil {
+				return err
+			}
+			// Recurse into the sub-directory
+			if err := checkout_tree(entryShaHex, entryPath); err != nil {
+				return err
+			}
+		} else { 
+			// It's a file (Blob)
+			blobData, err := decompressObject(entryShaHex)
+			if err != nil {
+				return err
+			}
+			
+			// Strip the "blob <size>\x00" header
+			blobParts := bytes.SplitN(blobData, []byte{0}, 2)
+			if len(blobParts) < 2 {
+				return errors.New("invalid blob format")
+			}
+			
+			// Handle standard files vs executable files
+			perm := os.FileMode(0644)
+			if modeStr == "100755" {
+				perm = 0755 
+			}
+			
+			// Write the actual file content to disk
+			if err := os.WriteFile(entryPath, blobParts[1], perm); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func decompressObject(sha string) ([]byte, error) {
