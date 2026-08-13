@@ -371,7 +371,7 @@ func handleClone(args []string) error {
 	fmt.Println("Clone completed (objects downloaded).")
 
 	fmt.Println("Checking out files...")
-    if err := checkout(wantedSHA, targetDir); err != nil {
+    if err := checkout(wantedSHA, "."); err != nil {
 		fmt.Printf("Error during checkout: %v\n", err)
 		return err
     }
