@@ -1,92 +1,186 @@
-# `mygit` - Custom Git Client in Go
+# mygit: Implementation and Architecture
 
-`mygit` is a lightweight, pure-Go implementation of a Git client built from scratch. It supports fundamental core object manipulation commands (`init`, `cat-file`, `hash-object`, `ls-tree`, `write-tree`, `commit-tree`) as well as advanced network features like Smart HTTP cloning, packfile parsing, and delta compression resolution.
+`mygit` is a small Go program that implements selected local Git operations and
+the parts of Smart HTTP cloning needed to download, unpack, and check out a
+repository. All implementation is currently in `app/main.go`. It uses only Go
+standard-library packages and stores objects in the current directory's `.git`
+directory.
 
----
+## Program Structure
 
-## Architecture & Core Protocols
+`main` is the command dispatcher. It requires a command name in `os.Args[1]`,
+routes the command to a handler, prints handler errors to standard error, and
+exits with status 1 on invalid commands or failures.
 
-### 1. Object Database Storage
+The implementation is organized into four functional areas:
 
-Git stores everything as content-addressable objects under `.git/objects/xx/yy...`, where `xx` is the first two characters of the object's SHA-1 hash and `yy...` is the remaining 38 characters.
+1. Command handlers validate arguments and provide command-line output.
+2. Object-database helpers read and write compressed Git objects.
+3. Pack and protocol helpers implement the binary formats used by clone.
+4. Checkout helpers turn downloaded commit, tree, and blob objects into files.
 
-* **Header Structure**: Every object is prepended with a type and size header followed by a null byte (`\x00`), e.g., `blob 14\x00content`.
-* **Compression**: Objects are compressed using standard `zlib` before being written to disk.
+There is no separate repository, object, transport, or checkout type. These
+areas are implemented as package-level functions and use the process working
+directory as the repository context.
 
+## Supported Commands
 
+### `init`
 
-### 2. Smart HTTP Protocol (`pkt-line`)
+Creates `.git`, `.git/objects`, `.git/refs`, and `.git/refs/heads` with mode
+`0755`. It writes `.git/HEAD` containing:
 
-Communication with remote repositories over HTTP uses the **packet-line (pkt-line)** format.
+```text
+ref: refs/heads/master
+```
 
-* **Length Prefixing**: Every line/packet is prefixed with a 4-hex-digit length indicator (which includes the 4 bytes of the length prefix itself).
+It does not create a branch reference or any other Git configuration files.
 
+### `cat-file -p <sha>`
 
-* **Discovery (`/info/refs`)**: The client reads the advertisement stream, skips the service line and flush packets (`0000`), and extracts the target reference SHA (e.g., `HEAD` or `refs/heads/master`).
+Reads the object identified by a 40-character SHA-1, decompresses it, removes
+the `<type> <size>\0` object header, and prints the remaining payload. The
+handler describes the argument as a blob SHA, but the underlying reader only
+requires a valid object hash and can return the payload of any object type.
 
+### `hash-object -w <file>`
 
-* **Upload Pack (`/git-upload-pack`)**: Sends `want <SHA> <capabilities>` packets followed by a flush packet (`0000`) and a `done` packet to trigger packfile generation from the server.
+Reads a file, constructs `blob <byte-length>\0` followed by the file bytes,
+computes the SHA-1 of that complete representation, compresses it with zlib,
+and writes it under `.git/objects/<first-two>/<remaining-38>`. It prints the
+resulting 40-character hash.
 
+### `ls-tree --name-only <tree-sha>`
 
+Reads and decompresses a tree object. Each tree entry is parsed as:
 
-### 3. Packfile Parsing & Delta Resolution
+```text
+<mode> <name>\0<20-byte binary object id>
+```
 
-When cloning a repository, the remote server responds with a binary packfile containing compressed objects. `mygit` handles this in a robust two-pass strategy:
+The command discards the mode and binary object ID and prints each entry name.
 
-* **Pass 1 (Base Objects & Queueing)**: Parses the packfile header (`PACK`, version, object count), extracts non-delta types (commits, trees, blobs, tags), writes them to the object database, and queues `REF_DELTA` objects (`objType == 7`) into a pending queue.
+### `write-tree`
 
+Recursively snapshots the current working directory into Git tree and blob
+objects. Entries are sorted by name for deterministic tree content. `.git` is
+skipped. Directories are represented with mode `40000`; all non-directory
+entries are read as regular files and represented with mode `100644`.
 
-* **Pass 2 (Multi-Pass Delta Resolution)**: Resolves delta chains iteratively. Because packfiles can list deltas before their base objects appear, a multi-pass approach handles out-of-order entries by re-queuing unresolved deltas until all base dependencies are satisfied on disk.
+For each file, `writeBlob` stores a blob and returns its SHA-1. For each
+directory, `writeTree` first creates child objects, then encodes its entries,
+prepends `tree <byte-length>\0`, hashes the complete object, and stores it. The
+top-level tree SHA is printed.
 
+### `commit-tree <tree-sha> -p <parent-sha> -m <message>`
 
-* **Delta Execution**: Implements binary patch instructions (`INSERT` and `COPY` with variable-length offsets and sizes) to reconstruct modified target payloads from base objects.
+Creates a commit object referring to the supplied tree and parent. Its payload
+contains a `parent` line, an `author` line, a `committer` line, a blank line,
+and the supplied message followed by a newline. The author and committer names
+and email addresses are fixed in the source, and both timestamps use the
+current time with the local numeric timezone offset.
 
+The complete `commit <byte-length>\0<payload>` representation is SHA-1 hashed,
+zlib-compressed, and stored in the object database. The new commit SHA is
+printed. This command does not update a branch reference.
 
+### `clone <url> <directory>`
 
----
+Cloning follows these stages:
 
-## Supported Commands Summary
+1. Create the target directory, change the process working directory to it,
+   and run `init`.
+2. Request `<url>/info/refs?service=git-upload-pack` and parse its pkt-line
+   advertisement. The service announcement and flush packets are ignored.
+3. Select a SHA from `HEAD`, `refs/heads/master`, or `refs/heads/main`.
+4. POST a `want <sha> side-band-64k` request and a `done` packet to
+   `<url>/git-upload-pack`.
+5. Remove upload-pack protocol framing and side-band progress messages from
+   the response, retaining the packfile bytes.
+6. Parse and write the packfile objects.
+7. Read the selected commit, find its root tree, and recursively write the
+   committed files into the cloned directory.
 
-| Command | Description |
-| --- | --- |
-| `init` | Initializes a new local `.git` directory structure (`objects`, `refs/heads`, and `HEAD`).|
-| `cat-file -p <sha>` | Decodes, decompresses, strips headers, and prints the content of any Git object.|
-| `hash-object -w <file>` | Hashes a file with the proper Git blob header, compresses it, and saves it to the object database.|
-| `ls-tree --name-only <sha>` | Parses a tree object and lists the filenames it contains.|
-| `write-tree` | Recursively writes the current working directory state into tree objects, returning the root SHA.|
-| `commit-tree <tree> -p <parent> -m <msg>` | Creates a commit object linking a tree to a parent commit with author/committer metadata.|
-| `clone <url> <dir>` | Performs Smart HTTP discovery, downloads packfiles, unpacks/resolves deltas, and checks out files into the target directory.|
+The clone operation does not create or update a local branch reference, and it
+does not restore the caller's original working directory after `os.Chdir`.
 
----
+## Object Database
 
-## Technical & Architectural Decisions
+Git objects are content-addressed. The SHA-1 is computed over the complete
+uncompressed object, including its header:
 
-* **Stream Parsing with `bufio.Reader**`: Standard `bytes.Reader` lacks delimiter-based scanning. Wrapping stream readers with `bufio.Reader` enables precise tracking using `.ReadBytes(' ')` and `.ReadBytes(0)` when parsing tree entries or packet lines.
+```text
+<type> <size>\0<payload>
+```
 
+`compressAndWriteObject` creates `.git/objects/<first-two>` and writes the
+complete object through a zlib writer. `decompressObject` validates the hash
+length, opens the corresponding path, decompresses it, and returns the full
+object including its header. The higher-level readers split at the first null
+byte to obtain the payload.
 
-* **Defensive Error Handling for EOF**: Parsing loops explicitly check for `io.EOF` to terminate safely without triggering unexpected stream truncation errors.
+## Smart HTTP and Pkt-Line Handling
 
+`readPktLine` reads four hexadecimal bytes, interprets the value as the total
+packet length including those four bytes, and reads the remaining payload.
+Length `0000` is represented as an empty packet. It is used while reading the
+reference advertisement.
 
-* **Side-Band Channel Multiplexing**: The packfile payload reader inspects channel side-band headers (`payload[0]`) to gracefully filter progress messages (`channel 2`) while capturing raw pack data (`channel 1`).
+For upload-pack, `fetchPackfile` constructs the request body manually. It sends
+one `want` packet, a flush packet, and one `done` packet. The response is read
+in full and then scanned as pkt-lines. `NAK` packets are ignored. Side-band
+channel 1 contributes pack data, channel 2 is printed as remote progress, and
+channel 3 becomes an error.
 
+The discovered capability text is recorded while parsing advertisement lines,
+but the request uses the fixed capability `side-band-64k` rather than
+negotiating capabilities dynamically.
 
+## Packfile Parsing and Delta Resolution
 
----
+`parseAndWritePackfile` expects the pack data to begin with `PACK`, followed by
+the version and a four-byte big-endian object count. Each object header uses
+Git's variable-length size encoding.
 
-## Debugging & Troubleshooting Log
+The parser uses two phases:
 
-### 1. The `ReadBytes` vs. `ReadByte` Type Discrepancy
+1. Base objects of types commit, tree, blob, and tag are decompressed from the
+   pack, given their normal Git headers, hashed, and stored. `REF_DELTA`
+   objects are retained with their 20-byte base SHA and delta instructions.
+2. Pending deltas are revisited repeatedly. A delta is applied once its base
+   object can be read from `.git/objects`. If a pass resolves no delta while
+   unresolved deltas remain, processing stops with a missing-base error.
 
-* **Issue**: Initially, code attempted to invoke `reader.ReadBytes(' ')` directly on a standard `bytes.Reader`, resulting in a compilation error (`reader.ReadBytes undefined`).
+`OFS_DELTA` objects are explicitly unsupported.
 
+`applyDelta` first reads the base object's payload, then reads the delta's
+source and target sizes. It executes insert instructions directly from the
+delta stream and copy instructions using the variable offset and size bit
+fields. A zero copy size means `0x10000`. The reconstructed payload receives
+the original base object type and a newly calculated size header before being
+hashed and stored.
 
-* **Resolution**: Wrapped the underlying reader inside a `bufio.Reader` (`bufio.NewReader(bytes.NewReader(content))`), which natively supports delimited reads required for separating object permissions, file names, and null bytes.
+## Checkout
 
+`checkout` loads a commit object, finds its first `tree <sha>` header line,
+and delegates to `checkout_tree`. Tree parsing uses `bufio.Reader` to read the
+mode, name, and exactly 20 bytes of binary object ID for each entry.
 
+Directories with mode `40000` are created recursively. Other entries are
+treated as blobs. Blob headers are removed before writing file contents. Mode
+`100755` produces an executable file with permissions `0755`; all other files
+use `0644`.
 
-### 2. Working Directory & Path Duplication during Checkout
+## Current Scope and Limitations
 
-* **Issue**: During `clone`, changing the working directory via `os.Chdir(targetDir)` while concurrently passing `targetDir` down to tree checkout functions resulted in redundant nested paths (e.g., `test_dir/test_dir/file.txt`), triggering `no such file or directory` runtime crashes.
-
-
-* **Resolution**: Standardized the checkout root to use relative paths (`"."`) immediately after switching the working process directory to `targetDir`, ensuring paths evaluate cleanly from the root of the newly cloned folder.
+- Only the command forms listed above are accepted.
+- Object IDs are expected to be full 40-character SHA-1 values.
+- The local implementation does not maintain the index, refs, branch state,
+  configuration, reflogs, or a working-tree status model.
+- `write-tree` treats every non-directory entry as a regular file and skips
+  only `.git`.
+- Clone supports `REF_DELTA` but not `OFS_DELTA` pack entries.
+- Clone selects one advertised commit and checks it out; it does not record a
+  remote-tracking branch or local branch.
+- The implementation relies on the current process working directory for all
+  `.git` access and changes that directory during cloning.
